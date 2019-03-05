@@ -1,0 +1,48 @@
+#!/bin/bash
+
+set -ex
+
+export PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
+
+getBaseImage() {
+  echo "docker://debian"
+}
+
+getBaseImageName() {
+  echo "registry-1.docker.io/library/debian:latest"
+}
+
+installPkg() {
+#  pacman -Syu --noconfirm --needed wget iproute git
+  apt update
+  apt install -y wget iproute2 git xz-utils
+}
+
+downloadGiteaPkg() {
+  if [ -e gitea-1.7.3-linux-amd64 ]; then
+    return
+  fi
+
+  echo Downloading gitea
+  wget -nc https://dl.gitea.io/gitea/1.7.3/gitea-1.7.3-linux-amd64.xz \
+       -O /usr/bin/gitea.xz
+  xz -d /usr/bin/gitea.xz
+  chmod 755 /usr/bin/gitea
+}
+
+launch() {
+  GITEA_CUSTOM=/root/gitea-box/custom gitea web
+}
+
+build() {
+  rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
+
+  installPkg
+  downloadGiteaPkg
+}
+
+main() {
+  $1 ${@:2}
+}
+
+main $@

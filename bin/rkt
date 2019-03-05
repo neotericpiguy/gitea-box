@@ -1,0 +1,94 @@
+#!/bin/bash
+
+set -e
+
+################################################################################
+image="docker://debian"
+image="gitea-box"
+projectDir="`git rev-parse --show-toplevel`"
+containerDir="/root/`basename $projectDir`"
+gitVolume="--volume git,kind=host,source=/home/$USER/.gitconfig,readOnly=true --mount volume=git,target=/root/.gitconfig"
+projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
+pkgVolume="--volume pkg,kind=host,source=/data/pkg --mount volume=pkg,target=/var/cache/pacman/pkg"
+aptVolume="--volume apt,kind=host,source=/var/cache/apt/archives --mount volume=apt,target=/var/cache/apt/archives"
+rktVersion="`rkt v | grep 'rkt Version' | sed -r 's/.*rkt Version: (.*).*/\1/g'`"
+rktOptions="--dns=host --insecure-options=all" #--net host needed for ssh forwarding
+afterImageOptions="--interactive"
+################################################################################
+
+parseArgs() {
+  ARGS=$(getopt -l "launch,pod,dnsname:,update" -- -- "$@")
+  if [ $? -ne 0 ]; then
+    echo "Bad arg"
+    exit 1
+  fi
+
+  eval set -- "$ARGS";
+
+  while true; do
+    case "$1" in
+      --pod)
+        pod="1"
+        echo "Spawn pod"
+        ;;
+      --dnsname)
+        shift
+        name="$1"
+        echo "DNSing to $name"
+        ;;
+      --update)
+        shift
+        updateAci
+        ;;
+      --launch)
+        launch=1
+        ;;
+      --rebuild)
+        rebuild="1"
+        ;;
+      --memtest)
+        memtest="1"
+        ;;
+      --)
+        shift
+        options="$@"
+        break;
+        ;;
+    esac
+    shift;
+  done
+}
+
+_depCheck() {
+  type ${1}>/dev/null 2>&1 || { echo >&2 "I require ${1} but it's not installed.  Aborting."; exit 1; }
+}
+
+main() {
+  parseArgs "$@"
+
+  echo "Using Image $image"
+  echo "Mounting $projectDir to $containerDir" 
+
+  local confVolumes="$confVolumes $projectVolume"
+
+  if [ -e /var/cache/pacman/pkg ]; then
+    echo pacman pkg cache found
+    confVolumes="$confVolumes $pkgVolume"
+  fi
+  [ -e /var/cache/apt/archives ] && confVolumes="$confVolumes $aptVolume"
+
+  [ "$pod" == "" ] && rktOptions="$rktOptions --net=host"
+  [ "$name" != "" ] && afterImageOptions="$afterImageOptions --name=dns-$name"
+
+  local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt $rktOptions $confVolumes run $image $afterImageOptions"
+
+  if [ $launch ]; then
+    $rktCmd --interactive --exec /bin/bash -- -c " \
+      cd $containerDir; ./bin/setup ;\
+      "
+  else
+    $rktCmd $stage1
+  fi
+}
+
+main $@

@@ -1,0 +1,125 @@
+#!/bin/bash
+
+set -e
+################################################################################
+projectDir="`git rev-parse --show-toplevel`"
+acVersion=`date +%Y.%m.%d`
+version=`date +%Y%m%d`
+rktDir="/data/rkt-buildboxes"
+################################################################################
+
+_usage() { 
+  echo "$0 [func]"
+  cat $0 | egrep "\(\) {" | sed -r 's/\{//g;/_.*/d' | sort
+}
+
+_chroot() {
+  local directory=$1
+  sudo arch-chroot $directory/rootfs
+}
+
+_buildAci() {
+  local directory=$1
+  local outputFile=$directory-$version.aci
+
+  [ ! -d "$directory" ] && (echo "directory" | exit 1)
+
+  _updateManifest $directory
+
+  echo "Build Aci $outputFile"
+  sudo time actool build --overwrite $directory $outputFile
+  sudo rkt run --insecure-options=all $outputFile
+}
+
+_updateManifest() {
+  local directory=$1
+  local created=`date -Is`
+  [ ! -d "$directory" ] && (echo "directory" | exit 1)
+#  https://github.com/rkt/rkt/issues/1034
+
+  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" $directory/manifest  | \
+  jq ".labels=([.labels[] | select (.name==\"version\") .value=\"$version\"])" | \
+  jq ".name = \"$directory\"" | \
+  jq ".app.exec = [\"/usr/bin/gitea\"]" | \
+  jq ".acVersion = \"$acVersion\"" | \
+  jq ".app.environment += [{ \"name\": \"GITEA_CUSTOM\", \"value\":\"/root/gitea-box/custom/\"}]" | \
+  sudo tee $directory/manifest.new
+
+  sudo less $directory/manifest.new
+
+  sudo mv $directory/manifest.new $directory/manifest
+}
+
+_extract() {
+  local imageSha=$1
+  local directory=$2
+  echo Extrating imageSha directory
+
+  sudo rkt image list | grep -i $imageSha
+  sudo rkt image extract --overwrite $imageSha $directory
+}
+
+buildBox() {
+  local target="gitea-box"
+  local setupFile="${projectDir}/bin/setup"
+  local targetDirectory="$target"
+
+  if [ ! -e ${setupFile} ]; then 
+    echo "No ${setupFile} present"
+    exit 1
+  fi
+
+  local baseImage=`${setupFile} getBaseImage`
+  echo $baseImage  
+
+  local baseImageName=`${setupFile} getBaseImageName`
+  echo $baseImageName  
+
+  local imageSha=`sudo rkt image list | grep -i ${baseImageName} | awk '{print $1}'`
+
+  if [ "$imageSha" == "" ]; then 
+    echo "Priming image list"
+    sudo rkt run $baseImage --insecure-options=all
+  fi
+
+  echo $imageSha
+#  [ -e ${targetDirectory} ] && sudo rm -rf ${targetDirectory}
+  _extract $imageSha ${targetDirectory}
+
+  if [ -e /var/cache/apt/archives ]; then
+    sudo mkdir -p ${targetDirectory}/rootfs/var/cache/apt/archives
+    sudo mount -o bind /var/cache/apt/archives ${targetDirectory}/rootfs/var/cache/apt/archives
+  fi
+
+  sudo cp ${setupFile} ${targetDirectory}/rootfs/root/setup
+
+  sudo arch-chroot ${targetDirectory}/rootfs /root/setup build || true
+#  sudo arch-chroot ${targetDirectory}/rootfs || true
+
+  sudo umount -l ${targetDirectory}/rootfs/proc || true
+  sudo umount -l ${targetDirectory}/rootfs/var/cache/apt/archives || true
+
+#  sudo rm ${targetDirectory}/rootfs/root/setup
+
+  _buildAci ${targetDirectory}
+}
+
+_depCheck() {
+  type ${1}>/dev/null 2>&1 || { echo >&2 "I require ${1} but it's not installed.  Aborting."; exit 1; }
+}
+
+_main() {
+  if [ $# -eq 0 ] ; then 
+    _usage
+    exit 1
+  fi
+
+ 	_depCheck arch-chroot
+ 	_depCheck jq
+ 	_depCheck time
+ 	_depCheck rkt
+
+  $1 ${@:2}
+}
+
+_main $@
