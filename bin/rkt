@@ -4,13 +4,14 @@ set -e
 
 ################################################################################
 image="docker://debian"
-image="gitea-box"
+image="docker://archlinux/base"
+#image="gitea-box"
 projectDir="`git rev-parse --show-toplevel`"
 containerDir="/root/`basename $projectDir`"
 gitVolume="--volume git,kind=host,source=/home/$USER/.gitconfig,readOnly=true --mount volume=git,target=/root/.gitconfig"
 projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
-pkgVolume="--volume pkg,kind=host,source=/data/pkg --mount volume=pkg,target=/var/cache/pacman/pkg"
-aptVolume="--volume apt,kind=host,source=/var/cache/apt/archives --mount volume=apt,target=/var/cache/apt/archives"
+#pkgVolume="--volume pkg,kind=host,source=/data/pkg --mount volume=pkg,target=/var/cache/pacman/pkg"
+#aptVolume="--volume apt,kind=host,source=/var/cache/apt/archives --mount volume=apt,target=/var/cache/apt/archives"
 rktVersion="`rkt v | grep 'rkt Version' | sed -r 's/.*rkt Version: (.*).*/\1/g'`"
 rktOptions="--dns=host --insecure-options=all" #--net host needed for ssh forwarding
 afterImageOptions="--interactive"
@@ -84,7 +85,7 @@ main() {
 
   if [ $launch ]; then
     $rktCmd --interactive --exec /bin/bash -- -c " \
-      cd $containerDir; ./bin/setup ;\
+      cd $containerDir; ./bin/setup start;\
       "
   else
     $rktCmd $stage1

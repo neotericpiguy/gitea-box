@@ -3,6 +3,7 @@
 set -ex
 
 export PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
+export GITEA_WORK_DIR=/var/lib/gitea
 
 getBaseImage() {
   echo "docker://debian"
@@ -13,9 +14,9 @@ getBaseImageName() {
 }
 
 installPkg() {
-#  pacman -Syu --noconfirm --needed wget iproute git
-  apt update
-  apt install -y wget iproute2 git xz-utils
+  pacman -Sy --noconfirm --needed wget iproute git sudo openssh unzip
+#  apt update
+#  apt install -y wget iproute2 git xz-utils
 }
 
 downloadGiteaPkg() {
@@ -28,10 +29,62 @@ downloadGiteaPkg() {
        -O /usr/bin/gitea.xz
   xz -d /usr/bin/gitea.xz
   chmod 755 /usr/bin/gitea
+
+  setcap CAP_NET_BIND_SERVICE=+eip /usr/sbin/gitea  # so that non root can bind ss
+
+  mkdir -p /var/lib/gitea
+  mount -o bind /root/gitea-box/gitea /var/lib/gitea
 }
 
 launch() {
-  GITEA_CUSTOM=/root/gitea-box/custom gitea web
+#  GITEA_CUSTOM=/root/gitea-box/custom gitea web
+#  GITEA_CUSTOM=/var/lib/gitea gitea web
+  pushd /home/gitea
+  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea
+
+#  2019/03/05 19:57:26 [T] AppPath: /usr/sbin/gitea
+#  2019/03/05 19:57:26 [T] AppWorkPath: /usr/sbin
+#  2019/03/05 19:57:26 [T] Custom path: /usr/sbin/custom
+
+  popd
+}
+
+userSetup() {
+  groupadd gitea
+  useradd -m gitea -g gitea
+}
+
+start() {
+  build
+  launch
+}
+
+backup() {
+  mkdir -p $GITEA_WORK_DIR/backup/
+  pushd $GITEA_WORK_DIR/backup/
+  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea dump -c $GITEA_WORK_DIR/conf/app.ini
+  popd
+}
+
+restore() {
+  local backupFile="$1"
+  local backupFolder=`mktemp -d`
+
+  [ ! -e $backupFile ] && exit 1
+  
+  unzip $backupFile -d $backupFolder
+
+  cp $backupFolder/custom/conf/app.ini $GITEA_WORK_DIR/conf/app.ini  
+  cp -rv $backupFolder/data $GITEA_WORK_DIR/ 
+  unzip  -o $backupFolder/gitea-repo.zip -d $GITEA_WORK_DIR/ 
+
+  mv $GITEA_WORK_DIR/data/gitea.db{,.bak} 
+  sqlite3 $GITEA_WORK_DIR/data/gitea.db < $backupFolder/gitea-db.sql 
+
+  chown -R gitea:gitea $GITEA_WORK_DIR
+  wait
+
+  rm -rf $backupFolder
 }
 
 build() {
@@ -39,6 +92,7 @@ build() {
 
   installPkg
   downloadGiteaPkg
+  userSetup
 }
 
 main() {
