@@ -6,23 +6,19 @@ export PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
 export GITEA_WORK_DIR=/var/lib/gitea
 
 getBaseImage() {
-  echo "docker://debian"
+  echo "docker://archlinux/base"
 }
 
 getBaseImageName() {
-  echo "registry-1.docker.io/library/debian:latest"
+  echo "registry-1.docker.io/archlinux/base:latest"
 }
 
 installPkg() {
-  pacman -Sy --noconfirm --needed wget iproute git sudo openssh unzip
-#  apt update
-#  apt install -y wget iproute2 git xz-utils
+  pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip
 }
 
 downloadGiteaPkg() {
-  if [ -e gitea-1.7.3-linux-amd64 ]; then
-    return
-  fi
+  [ -e /usr/bin/gitea ] && return
 
   echo Downloading gitea
   wget -nc https://dl.gitea.io/gitea/1.7.3/gitea-1.7.3-linux-amd64.xz \
@@ -37,21 +33,14 @@ downloadGiteaPkg() {
 }
 
 launch() {
-#  GITEA_CUSTOM=/root/gitea-box/custom gitea web
-#  GITEA_CUSTOM=/var/lib/gitea gitea web
-  pushd /home/gitea
+  pushd /home/gitea # you have to be in a directory that have a writeable .git
   sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea
-
-#  2019/03/05 19:57:26 [T] AppPath: /usr/sbin/gitea
-#  2019/03/05 19:57:26 [T] AppWorkPath: /usr/sbin
-#  2019/03/05 19:57:26 [T] Custom path: /usr/sbin/custom
-
   popd
 }
 
 userSetup() {
-  groupadd gitea
-  useradd -m gitea -g gitea
+  groupadd gitea || true
+  useradd -m gitea -g gitea || true
 }
 
 start() {
@@ -64,6 +53,33 @@ backup() {
   pushd $GITEA_WORK_DIR/backup/
   sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea dump -c $GITEA_WORK_DIR/conf/app.ini
   popd
+}
+
+buildAci() {
+  [ $USER == "root" ] && exit 1
+
+  local uuid="$1"
+  local outputAci=gitea-box.aci
+  echo Building Aci
+
+  sudo rkt stop $uuid
+  echo ensuring stoppage 
+
+  local state=`sudo rkt list | grep -i $uuid | awk '{print $4}'`
+  while [[ "$state" == "running" ]]; do
+    sudo rkt stop $uuid
+    state=`sudo rkt list | grep -i 92b4bd88 | awk '{print $4}'`
+    sleep 1
+  done
+
+  sudo df -h | grep -i run/$uuid | awk '{print $6}' | xargs sudo umount -l || true
+
+  sudo rkt export --overwrite $uuid $outputAci
+#  tar -xvf $outputAci manifest
+#  vi manifest
+#  tar -uvf $outputAci manifest
+
+  sudo rkt run --insecure-options=all $outputAci
 }
 
 restore() {
