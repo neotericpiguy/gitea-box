@@ -16,7 +16,7 @@ _depCheck() {
 baseImage="docker://archlinux/base"
 
 parseArgs() {
-  ARGS=$(getopt -l "dnsname:" -- -- "$@")
+  ARGS=$(getopt -l "dnsname:,launch,rebuild" -- -- "$@")
   if [ $? -ne 0 ]; then
     echo "Bad arg"
     exit 1
@@ -32,9 +32,10 @@ parseArgs() {
         echo "DNSing to $dnsname"
         ;;
       --launch)
-        shift
-        dnsname="dns-$1"
-        echo "DNSing to $dnsname"
+        launch=1
+        ;;
+      --rebuild)
+        rebuild=1
         ;;
       --)
         shift
@@ -241,6 +242,16 @@ main() {
   fi
 
   parseArgs $@
+
+  if [ ! -z $launch ]; then
+    launchPod
+    return
+  fi
+
+  if [ ! -z $rebuild ]; then
+    buildAci
+    return
+  fi
 
   $1 ${@:2}
 }
