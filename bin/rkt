@@ -2,7 +2,7 @@
 
 #sudo rkt run --insecure-options=all --interactive --volume project,kind=host,source=`pwd`/gitea --mount volume=project,target=/var/lib/gitea gitea-box --name=dns-giteadotlocal
 
-#set -e
+set -e
 
 PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
 GITEA_WORK_DIR=/var/lib/gitea
@@ -31,6 +31,11 @@ parseArgs() {
         dnsname="dns-$1"
         echo "DNSing to $dnsname"
         ;;
+      --launch)
+        shift
+        dnsname="dns-$1"
+        echo "DNSing to $dnsname"
+        ;;
       --)
         shift
         break;
@@ -45,8 +50,8 @@ launchPod() {
 
   local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
   $rktCmd --name=$dnsname  --interactive --exec /bin/bash -- -c " \
-          cd $containerDir; $containerDir/bin/rkt launch;\
-          "
+cd $containerDir; $containerDir/bin/rkt launch;\
+"
 }
 
 installPkg() {
@@ -62,15 +67,14 @@ downloadGiteaPkg() {
        -O /usr/bin/gitea.xz
   xz -d /usr/bin/gitea.xz
   chmod 755 /usr/bin/gitea
-
 }
 
 start() {
+  pushd /home/gitea # you have to be in a directory that have a writeable .git
   setcap CAP_NET_BIND_SERVICE=+eip /usr/sbin/gitea  # so that non root can bind ss
 
   startBackupTimer &
 
-  pushd /home/gitea # you have to be in a directory that have a writeable .git
   sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea
   popd
 }
@@ -78,6 +82,9 @@ start() {
 userSetup() {
   groupadd gitea || true
   useradd -m gitea -g gitea || true
+  pushd /home/gitea
+    sudo -u gitea git init || true
+  popd
 }
 
 launch() {
@@ -138,16 +145,16 @@ buildAciImage() {
   echo Building Aci
 
   echo ensuring stoppage 
-  sudo rkt stop $uuid
+  sudo rkt stop $uuid || true
   local state=`sudo rkt list | grep -i $uuid | awk '{print $4}'`
-  while [[ "$state" == "running" ]]; do
-    sudo rkt stop $uuid
+  while [[ "$state" == "running" ]]; do 
+    sudo rkt stop $uuid || true
     state=`sudo rkt list | grep -i 92b4bd88 | awk '{print $4}'`
     sleep 1
   done
 
   #unmount !!! rootfs that aren't unmounted properly
-  sudo df -h | grep -i run/$uuid | awk '{print $6}' | xargs sudo umount -l 2>&1 > /dev/null || true 
+  sudo df -h | grep -i /$uuid | awk '{print $6}' | xargs sudo umount -l 2>&1 > /dev/null || true 
 
   echo "Exporting $uuid to $outputAci"
   sudo rkt export --overwrite $uuid $outputAci
@@ -171,17 +178,16 @@ buildAci() {
   [ $USER == "root" ] && exit 1
 
   local tempFile=`mktemp`
+  rm $tempFile
 
   name=`basename $tempFile | sed -r 's/tmp.//g'`
   name=${name,,}
 
-
   local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
   $rktCmd --name=$name  --interactive --exec /bin/bash -- -c " \
-          cd $containerDir; $containerDir/bin/rkt build;\
-          "
+cd $containerDir; bash -x $containerDir/bin/rkt build"
 
-  local uuid=sudo rkt list | grep $name | awk '{print $1}'
+  local uuid=`sudo rkt list | grep $name | awk '{print $1}'`
   
   buildAciImage $uuid
 }
@@ -219,12 +225,13 @@ build() {
 }
 
 main() {
-  set +e
   if hash git 2>/dev/null; then
-    projectDir="`git rev-parse --show-toplevel`"
-    containerDir="/root/`basename $projectDir`"
-    projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
-    boxVolume="--volume gitea,kind=host,source=$projectDir/gitea --mount volume=gitea,target=/var/lib/gitea"
+    if  git rev-parse ; then
+      projectDir="`git rev-parse --show-toplevel`"
+      containerDir="/root/`basename $projectDir`"
+      projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
+      boxVolume="--volume gitea,kind=host,source=$projectDir/gitea --mount volume=gitea,target=/var/lib/gitea"
+    fi
   fi
 
   if [ $# -eq 0 ]; then
