@@ -1,24 +1,22 @@
 #!/bin/bash
 
-set -e
+#sudo rkt run --insecure-options=all --interactive --volume project,kind=host,source=`pwd`/gitea --mount volume=project,target=/var/lib/gitea gitea-box --name=dns-giteadotlocal
 
-################################################################################
-image="docker://debian"
-image="docker://archlinux/base"
-#image="gitea-box"
-projectDir="`git rev-parse --show-toplevel`"
-containerDir="/root/`basename $projectDir`"
-gitVolume="--volume git,kind=host,source=/home/$USER/.gitconfig,readOnly=true --mount volume=git,target=/root/.gitconfig"
-projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
-#pkgVolume="--volume pkg,kind=host,source=/data/pkg --mount volume=pkg,target=/var/cache/pacman/pkg"
-#aptVolume="--volume apt,kind=host,source=/var/cache/apt/archives --mount volume=apt,target=/var/cache/apt/archives"
-rktVersion="`rkt v | grep 'rkt Version' | sed -r 's/.*rkt Version: (.*).*/\1/g'`"
-rktOptions="--dns=host --insecure-options=all" #--net host needed for ssh forwarding
-afterImageOptions="--interactive"
-################################################################################
+#set -e
+
+PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
+GITEA_WORK_DIR=/var/lib/gitea
+
+_depCheck() {
+  for tool in $@; do
+    type ${tool}>/dev/null 2>&1 || { echo >&2 "I require ${tool} but it's not installed.  Aborting."; exit 1; }
+  done
+}
+
+baseImage="docker://archlinux/base"
 
 parseArgs() {
-  ARGS=$(getopt -l "launch,pod,dnsname:,update" -- -- "$@")
+  ARGS=$(getopt -l "dnsname:" -- -- "$@")
   if [ $? -ne 0 ]; then
     echo "Bad arg"
     exit 1
@@ -28,31 +26,13 @@ parseArgs() {
 
   while true; do
     case "$1" in
-      --pod)
-        pod="1"
-        echo "Spawn pod"
-        ;;
       --dnsname)
         shift
-        name="$1"
-        echo "DNSing to $name"
-        ;;
-      --update)
-        shift
-        updateAci
-        ;;
-      --launch)
-        launch=1
-        ;;
-      --rebuild)
-        rebuild="1"
-        ;;
-      --memtest)
-        memtest="1"
+        dnsname="dns-$1"
+        echo "DNSing to $dnsname"
         ;;
       --)
         shift
-        options="$@"
         break;
         ;;
     esac
@@ -60,35 +40,202 @@ parseArgs() {
   done
 }
 
-_depCheck() {
-  type ${1}>/dev/null 2>&1 || { echo >&2 "I require ${1} but it's not installed.  Aborting."; exit 1; }
+launchPod() {
+  [ $USER == "root" ] && exit 1
+
+  local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
+  $rktCmd --name=$dnsname  --interactive --exec /bin/bash -- -c " \
+          cd $containerDir; $containerDir/bin/rkt launch;\
+          "
+}
+
+installPkg() {
+  pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip awk
+  rm -rf /var/cache/pacman/pkg/*
+}
+
+downloadGiteaPkg() {
+  [ -e /usr/bin/gitea ] && return
+
+  echo Downloading gitea
+  wget -nc https://dl.gitea.io/gitea/1.7.3/gitea-1.7.3-linux-amd64.xz \
+       -O /usr/bin/gitea.xz
+  xz -d /usr/bin/gitea.xz
+  chmod 755 /usr/bin/gitea
+
+}
+
+start() {
+  setcap CAP_NET_BIND_SERVICE=+eip /usr/sbin/gitea  # so that non root can bind ss
+
+  startBackupTimer &
+
+  pushd /home/gitea # you have to be in a directory that have a writeable .git
+  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea
+  popd
+}
+
+userSetup() {
+  groupadd gitea || true
+  useradd -m gitea -g gitea || true
+}
+
+launch() {
+  build
+  start 
+}
+
+backup() {
+  mkdir -p $GITEA_WORK_DIR/backup/
+  pushd $GITEA_WORK_DIR/backup/
+  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea dump -c $GITEA_WORK_DIR/conf/app.ini
+  popd
+}
+
+startBackupTimer() {
+  local backupInterval="`egrep \"^BACKUP_INTERVAL\" $GITEA_WORK_DIR/conf/app.ini | sed -r 's/.*=\ *//g'`"
+  local backupSize="`egrep \"^BACKUP_SIZE\" $GITEA_WORK_DIR/conf/app.ini | sed -r 's/.*=\ *//g'`"
+  local timezone="`egrep \"^TIMEZONE\" $GITEA_WORK_DIR/conf/app.ini | sed -r 's/.*=\ *//g'`"
+
+  [ -z $backupInterval ] && return
+
+  if [ ! -z $timezone ]; then
+    echo Setting Timezone $timezone
+    if [ ! -e /usr/share/zoneinfo/$timezone ]; then
+      echo Invalid timezone $timezone
+      exit 1
+    fi
+    ln -sf /usr/share/zoneinfo/$timezone /etc/localtime
+  fi
+
+  echo "Backing up every $backupInterval seconds"
+  echo "Backup size $backupSize"
+  while :; do 
+    if [ ! -z $backupSize ] ; then 
+      pushd $GITEA_WORK_DIR/backup/
+      ls -t | awk "NR>$backupSize" | xargs -r rm 
+      popd
+    fi
+
+    echo "Next backup: `date -d \"+$backupInterval seconds\"`"
+
+    sleep $backupInterval
+    backup
+  done
+}
+
+buildAciImage() {
+  [ $USER == "root" ] && exit 1
+
+ 	_depCheck jq actool
+
+  local uuid="$1"
+  local project="$(basename `git rev-parse --show-toplevel`)"
+  local acVersion=`date +%Y.%m.%d`
+  local version=`date +%Y%m%d`
+  local created=`date -Is`
+  local outputAci=$project-$version.aci
+  echo Building Aci
+
+  echo ensuring stoppage 
+  sudo rkt stop $uuid
+  local state=`sudo rkt list | grep -i $uuid | awk '{print $4}'`
+  while [[ "$state" == "running" ]]; do
+    sudo rkt stop $uuid
+    state=`sudo rkt list | grep -i 92b4bd88 | awk '{print $4}'`
+    sleep 1
+  done
+
+  #unmount !!! rootfs that aren't unmounted properly
+  sudo df -h | grep -i run/$uuid | awk '{print $6}' | xargs sudo umount -l 2>&1 > /dev/null || true 
+
+  echo "Exporting $uuid to $outputAci"
+  sudo rkt export --overwrite $uuid $outputAci
+
+  echo "Updateing manifest"
+  tar -xvf $outputAci manifest
+
+  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" manifest  | \
+  jq ".labels=([.labels[] | select (.name==\"version\") .value=\"$version\"])" | \
+  jq ".name = \"$project\"" | \
+  jq ".app.exec = [\"/usr/bin/$project\",\"start\"]" | \
+  jq ".acVersion = \"$acVersion\"" | \
+  sudo tee manifest.new
+  actool patch-manifest --replace --manifest=manifest.new $outputAci
+
+  sudo rm manifest manifest.new
+  sudo rkt run --insecure-options=all $outputAci
+}
+
+buildAci() {
+  [ $USER == "root" ] && exit 1
+
+  local tempFile=`mktemp`
+
+  name=`basename $tempFile | sed -r 's/tmp.//g'`
+  name=${name,,}
+
+
+  local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
+  $rktCmd --name=$name  --interactive --exec /bin/bash -- -c " \
+          cd $containerDir; $containerDir/bin/rkt build;\
+          "
+
+  local uuid=sudo rkt list | grep $name | awk '{print $1}'
+  
+  buildAciImage $uuid
+}
+
+restore() {
+  local backupFile="$1"
+  local backupFolder=`mktemp -d`
+
+  [ ! -e $backupFile ] && exit 1
+  
+  unzip $backupFile -d $backupFolder
+
+  cp $backupFolder/custom/conf/app.ini $GITEA_WORK_DIR/conf/app.ini  
+  cp -rv $backupFolder/data $GITEA_WORK_DIR/ 
+  unzip  -o $backupFolder/gitea-repo.zip -d $GITEA_WORK_DIR/ 
+
+  mv $GITEA_WORK_DIR/data/gitea.db{,.bak} 
+  sqlite3 $GITEA_WORK_DIR/data/gitea.db < $backupFolder/gitea-db.sql 
+
+  chown -R gitea:gitea $GITEA_WORK_DIR
+  wait
+
+  rm -rf $backupFolder
+}
+
+build() {
+  rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
+
+  installPkg
+  downloadGiteaPkg
+  userSetup
+
+  local project="$(basename `git rev-parse --show-toplevel`)"
+  cp $0 /usr/bin/$project
 }
 
 main() {
-  parseArgs "$@"
-
-  echo "Using Image $image"
-  echo "Mounting $projectDir to $containerDir" 
-
-  local confVolumes="$confVolumes $projectVolume"
-
-  if [ -e /var/cache/pacman/pkg ]; then
-    echo pacman pkg cache found
-    confVolumes="$confVolumes $pkgVolume"
+  set +e
+  if hash git 2>/dev/null; then
+    projectDir="`git rev-parse --show-toplevel`"
+    containerDir="/root/`basename $projectDir`"
+    projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
+    boxVolume="--volume gitea,kind=host,source=$projectDir/gitea --mount volume=gitea,target=/var/lib/gitea"
   fi
 
-  [ "$pod" == "" ] && rktOptions="$rktOptions --net=host"
-  [ "$name" != "" ] && afterImageOptions="$afterImageOptions --name=dns-$name"
-
-  local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt $rktOptions $confVolumes run $image $afterImageOptions"
-
-  if [ $launch ]; then
-    $rktCmd --interactive --exec /bin/bash -- -c " \
-      cd $containerDir; ./bin/setup launch;\
-      "
-  else
-    $rktCmd $stage1
+  if [ $# -eq 0 ]; then
+    local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
+    $rktCmd --interactive 
+    return
   fi
+
+  parseArgs $@
+
+  $1 ${@:2}
 }
 
 main $@
