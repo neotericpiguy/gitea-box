@@ -76,7 +76,6 @@ main() {
     echo pacman pkg cache found
     confVolumes="$confVolumes $pkgVolume"
   fi
-  [ -e /var/cache/apt/archives ] && confVolumes="$confVolumes $aptVolume"
 
   [ "$pod" == "" ] && rktOptions="$rktOptions --net=host"
   [ "$name" != "" ] && afterImageOptions="$afterImageOptions --name=dns-$name"
@@ -85,7 +84,7 @@ main() {
 
   if [ $launch ]; then
     $rktCmd --interactive --exec /bin/bash -- -c " \
-      cd $containerDir; ./bin/setup start;\
+      cd $containerDir; ./bin/setup launch;\
       "
   else
     $rktCmd $stage1

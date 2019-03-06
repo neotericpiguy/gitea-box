@@ -1,9 +1,9 @@
 #!/bin/bash
 
-set -ex
+set -e
 
-export PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
-export GITEA_WORK_DIR=/var/lib/gitea
+PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
+GITEA_WORK_DIR=/var/lib/gitea
 
 getBaseImage() {
   echo "docker://archlinux/base"
@@ -32,7 +32,9 @@ downloadGiteaPkg() {
   mount -o bind /root/gitea-box/gitea /var/lib/gitea
 }
 
-launch() {
+start() {
+  setcap CAP_NET_BIND_SERVICE=+eip /usr/sbin/gitea
+
   pushd /home/gitea # you have to be in a directory that have a writeable .git
   sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea
   popd
@@ -43,9 +45,9 @@ userSetup() {
   useradd -m gitea -g gitea || true
 }
 
-start() {
+launch() {
   build
-  launch
+  start 
 }
 
 backup() {
@@ -58,13 +60,18 @@ backup() {
 buildAci() {
   [ $USER == "root" ] && exit 1
 
+ 	_depCheck jq actool
+
   local uuid="$1"
-  local outputAci=gitea-box.aci
+  local project="$(basename `git rev-parse --show-toplevel`)"
+  local acVersion=`date +%Y.%m.%d`
+  local version=`date +%Y%m%d`
+  local created=`date -Is`
+  local outputAci=$project-$version.aci
   echo Building Aci
 
-  sudo rkt stop $uuid
   echo ensuring stoppage 
-
+  sudo rkt stop $uuid
   local state=`sudo rkt list | grep -i $uuid | awk '{print $4}'`
   while [[ "$state" == "running" ]]; do
     sudo rkt stop $uuid
@@ -72,13 +79,24 @@ buildAci() {
     sleep 1
   done
 
-  sudo df -h | grep -i run/$uuid | awk '{print $6}' | xargs sudo umount -l || true
+  #unmount !!! rootfs that aren't unmounted properly
+  sudo df -h | grep -i run/$uuid | awk '{print $6}' | xargs sudo umount -l 2>&1 > /dev/null || true 
 
+  echo "Exporting $uuid to aci"
   sudo rkt export --overwrite $uuid $outputAci
-#  tar -xvf $outputAci manifest
-#  vi manifest
-#  tar -uvf $outputAci manifest
 
+  echo "Updateing manifest"
+  tar -xvf $outputAci manifest
+
+  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" manifest  | \
+  jq ".labels=([.labels[] | select (.name==\"version\") .value=\"$version\"])" | \
+  jq ".name = \"$project\"" | \
+  jq ".app.exec = [\"/usr/bin/$project\",\"start\"]" | \
+  jq ".acVersion = \"$acVersion\"" | \
+  sudo tee manifest.new
+  actool patch-manifest --replace --manifest=manifest.new $outputAci
+
+  rm manifest manifest.new
   sudo rkt run --insecure-options=all $outputAci
 }
 
@@ -109,9 +127,19 @@ build() {
   installPkg
   downloadGiteaPkg
   userSetup
+
+  local project="$(basename `git rev-parse --show-toplevel`)"
+  cp $0 /usr/bin/$project
+}
+
+_depCheck() {
+  for tool in $@; do
+    type ${tool}>/dev/null 2>&1 || { echo >&2 "I require ${tool} but it's not installed.  Aborting."; exit 1; }
+  done
 }
 
 main() {
+
   $1 ${@:2}
 }
 
