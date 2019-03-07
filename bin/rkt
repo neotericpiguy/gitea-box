@@ -221,8 +221,46 @@ build() {
   downloadGiteaPkg
   userSetup
 
+  echo "127.0.0.1 localhost" | tee -a /etc/hosts
+
   local project="$(basename `git rev-parse --show-toplevel`)"
   cp $0 /usr/bin/$project
+}
+
+install() {
+  local project="$(basename `git rev-parse --show-toplevel`)"
+  # make the rkt container start on boot
+  # should also check that the volume mounts are correct
+
+  local workDir="$1"
+
+  [ -z $workDir ] && (exit 1)
+
+  workDir=`pwd`/$workDir
+
+  if [ ! -d $workDir ]; then
+    echo "Directory not found $workDir"
+    return
+  fi
+
+ 	_depCheck rkt
+
+  echo Installing $workDir
+
+  local rktCmd=`which rkt`
+
+  echo "[Unit]
+Description=$project
+
+[Service]
+ExecStart=
+ExecStart=$rktCmd run --insecure-options=all --interactive --volume project,kind=host,source=$workDir --mount volume=project,target=/var/lib/gitea $project --name=dns-giteadotlocal
+
+[Install]
+WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service
+
+  sudo systemctl enable $project.service
+  sudo systemctl restart $project.service
 }
 
 main() {
