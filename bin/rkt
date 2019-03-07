@@ -1,11 +1,10 @@
 #!/bin/bash
 
-#sudo rkt run --insecure-options=all --interactive --volume project,kind=host,source=`pwd`/gitea --mount volume=project,target=/var/lib/gitea gitea-box --name=dns-giteadotlocal
-
 set -e
 
 PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
 GITEA_WORK_DIR=/var/lib/gitea
+baseImage="docker://archlinux/base"
 
 _depCheck() {
   for tool in $@; do
@@ -13,7 +12,17 @@ _depCheck() {
   done
 }
 
-baseImage="docker://archlinux/base"
+_getVal() {
+  local key="$1"
+  local file="$2"
+  local val="`egrep \"^$key\" $file | sed -r 's/.*=\ *//g'`"
+
+  if [ "$val" == "" ]; then
+    echo $3
+  else
+    echo "$val"
+  fi
+}
 
 parseArgs() {
   ARGS=$(getopt -l "dnsname:,launch,rebuild" -- -- "$@")
@@ -49,7 +58,6 @@ parseArgs() {
 launchPod() {
   [ $USER == "root" ] && exit 1
 
-  local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
   $rktCmd --name=$dnsname  --interactive --exec /bin/bash -- -c " \
 cd $containerDir; $containerDir/bin/rkt launch;\
 "
@@ -57,7 +65,6 @@ cd $containerDir; $containerDir/bin/rkt launch;\
 
 installPkg() {
   pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip awk
-  rm -rf /var/cache/pacman/pkg/*
 }
 
 downloadGiteaPkg() {
@@ -83,9 +90,6 @@ start() {
 userSetup() {
   groupadd gitea || true
   useradd -m gitea -g gitea || true
-  pushd /home/gitea
-    sudo -u gitea git init || true
-  popd
 }
 
 launch() {
@@ -101,9 +105,9 @@ backup() {
 }
 
 startBackupTimer() {
-  local backupInterval="`egrep \"^BACKUP_INTERVAL\" $GITEA_WORK_DIR/conf/app.ini | sed -r 's/.*=\ *//g'`"
-  local backupSize="`egrep \"^BACKUP_SIZE\" $GITEA_WORK_DIR/conf/app.ini | sed -r 's/.*=\ *//g'`"
-  local timezone="`egrep \"^TIMEZONE\" $GITEA_WORK_DIR/conf/app.ini | sed -r 's/.*=\ *//g'`"
+  local backupInterval=`_getVal "BACKUP_INTERVAL" "$GITEA_WORK_DIR/conf/app.ini"`
+  local backupSize=`_getVal "BACKUP_SIZE" "$GITEA_WORK_DIR/conf/app.ini"`
+  local timezone=`_getVal "TIMEZONE" "$GITEA_WORK_DIR/conf/app.ini"`
 
   [ -z $backupInterval ] && return
 
@@ -175,7 +179,7 @@ buildAciImage() {
   sudo rkt run --insecure-options=all $outputAci
 }
 
-buildAci() {
+buildAci() { #--rebuild
   [ $USER == "root" ] && exit 1
 
   local tempFile=`mktemp`
@@ -184,7 +188,6 @@ buildAci() {
   name=`basename $tempFile | sed -r 's/tmp.//g'`
   name=${name,,}
 
-  local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
   $rktCmd --name=$name  --interactive --exec /bin/bash -- -c " \
 cd $containerDir; bash -x $containerDir/bin/rkt build"
 
@@ -215,8 +218,6 @@ restore() {
 }
 
 build() {
-  rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
-
   installPkg
   downloadGiteaPkg
   userSetup
@@ -234,7 +235,7 @@ install() {
 
   local workDir="$1"
 
-  [ -z $workDir ] && (exit 1)
+  [ -z $workDir ] && (echo "No work directory found"; exit 1)
 
   workDir=`pwd`/$workDir
 
@@ -257,7 +258,7 @@ ExecStart=
 ExecStart=$rktCmd run --insecure-options=all --interactive --volume project,kind=host,source=$workDir --mount volume=project,target=/var/lib/gitea $project --name=dns-giteadotlocal
 
 [Install]
-WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service
+WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service > /dev/null
 
   sudo systemctl enable $project.service
   sudo systemctl restart $project.service
@@ -265,16 +266,24 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service
 
 main() {
   if hash git 2>/dev/null; then
-    if  git rev-parse ; then
+    if git rev-parse ; then
       projectDir="`git rev-parse --show-toplevel`"
       containerDir="/root/`basename $projectDir`"
       projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
       boxVolume="--volume gitea,kind=host,source=$projectDir/gitea --mount volume=gitea,target=/var/lib/gitea"
+
+      if [ -e /etc/pacman.conf ]; then
+        cacheDir=`_getVal CacheDir /etc/pacman.conf /var/cache/pacman/pkg`
+        echo "Pacman cache: $cacheDir"
+        cacheVolume="--volume pkg,kind=host,source=$cacheDir --mount volume=pkg,target=/var/cache/pacman/pkg"
+      fi
+
+      rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $cacheVolume $boxVolume $projectVolume run $baseImage"
     fi
   fi
 
   if [ $# -eq 0 ]; then
-    local rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $boxVolume $projectVolume run $baseImage"
+    echo $rktCmd
     $rktCmd --interactive 
     return
   fi
