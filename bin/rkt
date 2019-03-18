@@ -4,6 +4,7 @@ set -e
 
 PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
 GITEA_WORK_DIR=/var/lib/gitea
+GITEA_VERSION=1.7.4
 baseImage="docker://archlinux/base"
 
 _depCheck() {
@@ -71,7 +72,7 @@ downloadGiteaPkg() {
   [ -e /usr/bin/gitea ] && return
 
   echo Downloading gitea
-  wget -nc https://dl.gitea.io/gitea/1.7.3/gitea-1.7.3-linux-amd64.xz \
+  wget -nc https://dl.gitea.io/gitea/${GITEA_VERSION}/gitea-${GITEA_VERSION}-linux-amd64.xz \
        -O /usr/bin/gitea.xz
   xz -d /usr/bin/gitea.xz
   chmod 755 /usr/bin/gitea
@@ -142,7 +143,6 @@ buildAciImage() {
  	_depCheck jq actool
 
   local uuid="$1"
-  local project="$(basename `git rev-parse --show-toplevel`)"
   local acVersion=`date +%Y.%m.%d`
   local version=`date +%Y%m%d`
   local created=`date -Is`
@@ -224,12 +224,13 @@ build() {
 
   echo "127.0.0.1 localhost" | tee -a /etc/hosts
 
-  local project="$(basename `git rev-parse --show-toplevel`)"
+  projectDir="`git rev-parse --show-toplevel`"
+  project="$(basename $projectDir)"
+
   cp $0 /usr/bin/$project
 }
 
 install() {
-  local project="$(basename `git rev-parse --show-toplevel`)"
   # make the rkt container start on boot
   # should also check that the volume mounts are correct
 
@@ -265,8 +266,10 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service > /d
 }
 
 main() {
+  rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
   if hash git 2>/dev/null; then
     if git rev-parse ; then
+      project="$(basename `git rev-parse --show-toplevel`)"
       projectDir="`git rev-parse --show-toplevel`"
       containerDir="/root/`basename $projectDir`"
       projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
