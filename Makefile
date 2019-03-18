@@ -9,4 +9,4 @@ all: aci
 	@echo $<
 
 aci: 
-	@$(PROJECT_DIR)/bin/rkt --rebuild
+	@bash -x $(PROJECT_DIR)/bin/rkt --rebuild

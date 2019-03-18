@@ -100,6 +100,7 @@ launch() {
 
 backup() {
   mkdir -p $GITEA_WORK_DIR/backup/
+  sudo chown -R gitea $GITEA_WORK_DIR/backup
   pushd $GITEA_WORK_DIR/backup/
   sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea dump -c $GITEA_WORK_DIR/conf/app.ini
   popd
@@ -112,6 +113,7 @@ startBackupTimer() {
 
   [ -z $backupInterval ] && return
 
+  mkdir -p $GITEA_WORK_DIR/backup/
   if [ ! -z $timezone ]; then
     echo Setting Timezone $timezone
     if [ ! -e /usr/share/zoneinfo/$timezone ]; then
@@ -142,11 +144,12 @@ buildAciImage() {
 
  	_depCheck jq actool
 
-  local uuid="$1"
+  local uuid=${1?"Require uuid"}
   local acVersion=`date +%Y.%m.%d`
+  local tmpManifest=`mktemp`
   local version=`date +%Y%m%d`
   local created=`date -Is`
-  local outputAci=$project-$version.aci
+  local outputAci=$podImage-$version.aci
   echo Building Aci
 
   echo ensuring stoppage 
@@ -165,18 +168,22 @@ buildAciImage() {
   sudo rkt export --overwrite $uuid $outputAci
 
   echo "Updateing manifest"
-  tar -xvf $outputAci manifest
+  actool cat-manifest $outputAci > $tmpManifest
 
-  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" manifest  | \
+  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" $tmpManifest  | \
   jq ".labels=([.labels[] | select (.name==\"version\") .value=\"$version\"])" | \
-  jq ".name = \"$project\"" | \
-  jq ".app.exec = [\"/usr/bin/$project\",\"start\"]" | \
+  jq ".name = \"$podImage\"" | \
+  jq ".app.exec = [\"/usr/bin/$podImage\",\"start\"]" | \
   jq ".acVersion = \"$acVersion\"" | \
-  sudo tee manifest.new
-  actool patch-manifest --replace --manifest=manifest.new $outputAci
+  sudo tee $tmpManifest.new
+  actool patch-manifest --replace --manifest=$tmpManifest.new $outputAci
 
-  sudo rm manifest manifest.new
-  sudo rkt run --insecure-options=all $outputAci
+  sudo rm $tmpManifest $tmpManifest.new
+
+  echo "Removing old images"
+  sudo rkt image list | grep $podImage:$version | awk '{print $1}' | xargs -r sudo rkt image rm
+
+  sudo rkt fetch --insecure-options=all $outputAci
 }
 
 buildAci() { #--rebuild
@@ -224,10 +231,9 @@ build() {
 
   echo "127.0.0.1 localhost" | tee -a /etc/hosts
 
-  projectDir="`git rev-parse --show-toplevel`"
-  project="$(basename $projectDir)"
+  init
 
-  cp $0 /usr/bin/$project
+  cp $0 /usr/bin/$podImage
 }
 
 install() {
@@ -256,7 +262,7 @@ Description=$project
 
 [Service]
 ExecStart=
-ExecStart=$rktCmd run --insecure-options=all --interactive --volume project,kind=host,source=$workDir --mount volume=project,target=/var/lib/gitea $project --name=dns-giteadotlocal
+ExecStart=$rktCmd run --insecure-options=all --interactive --volume project,kind=host,source=$workDir --mount volume=project,target=/var/lib/gitea $podImage --name=dns-giteadotlocal
 
 [Install]
 WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service > /dev/null
@@ -265,25 +271,61 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service > /d
   sudo systemctl restart $project.service
 }
 
-main() {
-  rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
+disableCacheCleanup() {
+  #important for not erasing the host pkg cache
+
+  if [ -e /etc/apt ]; then
+    rm -rf /etc/apt/apt.conf.d/*
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "1";' | tee /etc/apt/apt.conf.d/10apt-keep-downloads
+  fi
+
+  if [ -e /etc/pacman.conf ]; then
+    rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
+  fi
+}
+
+init() {
   if hash git 2>/dev/null; then
     if git rev-parse ; then
-      project="$(basename `git rev-parse --show-toplevel`)"
       projectDir="`git rev-parse --show-toplevel`"
+      project="$(basename $projectDir)"
       containerDir="/root/`basename $projectDir`"
       projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
       boxVolume="--volume gitea,kind=host,source=$projectDir/gitea --mount volume=gitea,target=/var/lib/gitea"
+      podImage="${project,,}-box"
 
+      volumes="$projectVolume $boxVolume"
       if [ -e /etc/pacman.conf ]; then
-        cacheDir=`_getVal CacheDir /etc/pacman.conf /var/cache/pacman/pkg`
+        local cacheDir=`_getVal CacheDir /etc/pacman.conf /var/cache/pacman/pkg`
         echo "Pacman cache: $cacheDir"
-        cacheVolume="--volume pkg,kind=host,source=$cacheDir --mount volume=pkg,target=/var/cache/pacman/pkg"
+        local cacheVolume="--volume pkg,kind=host,source=$cacheDir --mount volume=pkg,target=/var/cache/pacman/pkg"
+        volumes="$volumes $cacheVolume"
       fi
 
-      rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --dns=host $cacheVolume $boxVolume $projectVolume run $baseImage"
+      if [ -e ~/.cache/yay ]; then
+        local cacheDir="/home/$USER/.cache/yay"
+        echo "yay cache: $cacheDir"
+        local cacheVolume="--volume yay,kind=host,source=$cacheDir --mount volume=yay,target=/home/yay/.cache/yay"
+        volumes="$volumes $cacheVolume"
+      fi
+
+      if [ -e /etc/apt/sources.list ]; then
+        local cacheDir="/var/cache/apt/archives"
+        echo "Apt cache: $cacheDir"
+        local aptVolume="--volume apt,kind=host,source=$cacheDir --mount volume=apt,target=/var/cache/apt/archives"
+        volumes="$volumes $aptVolume"
+      fi
+
+      rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --insecure-options=all --dns=host $volumes run $baseImage"
+      podRktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --insecure-options=all --dns=host $volumes run $podImage"
     fi
   fi
+}
+
+main() {
+  disableCacheCleanup
+
+  init
 
   if [ $# -eq 0 ]; then
     echo $rktCmd
