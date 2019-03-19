@@ -64,10 +64,6 @@ cd $containerDir; $containerDir/bin/rkt launch;\
 "
 }
 
-installPkg() {
-  pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip awk
-}
-
 downloadGiteaPkg() {
   [ -e /usr/bin/gitea ] && return
 
@@ -84,13 +80,8 @@ start() {
 
   startBackupTimer &
 
-  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea
+  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR/etc GITEA_CUSTOM=$GITEA_WORK_DIR/etc gitea
   popd
-}
-
-userSetup() {
-  groupadd gitea || true
-  useradd -m gitea -g gitea || true
 }
 
 launch() {
@@ -102,14 +93,14 @@ backup() {
   mkdir -p $GITEA_WORK_DIR/backup/
   sudo chown -R gitea $GITEA_WORK_DIR/backup
   pushd $GITEA_WORK_DIR/backup/
-  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR GITEA_CUSTOM=$GITEA_WORK_DIR gitea dump -c $GITEA_WORK_DIR/conf/app.ini
+  sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR/etc GITEA_CUSTOM=$GITEA_WORK_DIR/etc gitea dump -c $GITEA_WORK_DIR/etc/conf/app.ini
   popd
 }
 
 startBackupTimer() {
-  local backupInterval=`_getVal "BACKUP_INTERVAL" "$GITEA_WORK_DIR/conf/app.ini"`
-  local backupSize=`_getVal "BACKUP_SIZE" "$GITEA_WORK_DIR/conf/app.ini"`
-  local timezone=`_getVal "TIMEZONE" "$GITEA_WORK_DIR/conf/app.ini"`
+  local backupInterval=`_getVal "BACKUP_INTERVAL" "$GITEA_WORK_DIR/etc/conf/app.ini"`
+  local backupSize=`_getVal "BACKUP_SIZE" "$GITEA_WORK_DIR/etc/conf/app.ini"`
+  local timezone=`_getVal "TIMEZONE" "$GITEA_WORK_DIR/etc/conf/app.ini"`
 
   [ -z $backupInterval ] && return
 
@@ -211,12 +202,12 @@ restore() {
   
   unzip $backupFile -d $backupFolder
 
-  cp $backupFolder/custom/conf/app.ini $GITEA_WORK_DIR/conf/app.ini  
-  cp -rv $backupFolder/data $GITEA_WORK_DIR/ 
-  unzip  -o $backupFolder/gitea-repo.zip -d $GITEA_WORK_DIR/ 
+  cp $backupFolder/custom/conf/app.ini $GITEA_WORK_DIR/etc/conf/app.ini  
+  cp -rv $backupFolder/data $GITEA_WORK_DIR/etc/
+  unzip  -o $backupFolder/gitea-repo.zip -d $GITEA_WORK_DIR/etc/
 
-  mv $GITEA_WORK_DIR/data/gitea.db{,.bak} 
-  sqlite3 $GITEA_WORK_DIR/data/gitea.db < $backupFolder/gitea-db.sql 
+  mv $GITEA_WORK_DIR/etc/data/gitea.db{,.bak} 
+  sqlite3 $GITEA_WORK_DIR/etc/data/gitea.db < $backupFolder/gitea-db.sql 
 
   chown -R gitea:gitea $GITEA_WORK_DIR
   wait
@@ -225,9 +216,13 @@ restore() {
 }
 
 build() {
-  installPkg
+  #install pkgs
+  pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip awk
+
   downloadGiteaPkg
-  userSetup
+
+  groupadd gitea || true
+  useradd -m gitea -g gitea || true
 
   echo "127.0.0.1 localhost" | tee -a /etc/hosts
 
