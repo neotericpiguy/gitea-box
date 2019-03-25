@@ -1,67 +1,27 @@
 #!/bin/bash
 
-set -e
+source ./bin/box-essentials/box-essentials
 
-PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
 GITEA_WORK_DIR=/var/lib/gitea
 GITEA_VERSION=1.7.4
 baseImage="docker://archlinux/base"
 
-_depCheck() {
-  for tool in $@; do
-    type ${tool}>/dev/null 2>&1 || { echo >&2 "I require ${tool} but it's not installed.  Aborting."; exit 1; }
-  done
-}
+volumeMap["`pwd`/gitea"]="/var/lib/gitea"
 
-_getVal() {
-  local key="$1"
-  local file="$2"
-  local val="`egrep \"^$key\" $file | sed -r 's/.*=\ *//g'`"
+build() {
+  #install pkgs
+  pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip awk
 
-  if [ "$val" == "" ]; then
-    echo $3
-  else
-    echo "$val"
-  fi
-}
+  downloadGiteaPkg
 
-parseArgs() {
-  ARGS=$(getopt -l "dnsname:,launch,rebuild" -- -- "$@")
-  if [ $? -ne 0 ]; then
-    echo "Bad arg"
-    exit 1
-  fi
+  groupadd gitea || true
+  useradd -m gitea -g gitea || true
 
-  eval set -- "$ARGS";
+  echo "127.0.0.1 localhost" | tee -a /etc/hosts
 
-  while true; do
-    case "$1" in
-      --dnsname)
-        shift
-        dnsname="dns-$1"
-        echo "DNSing to $dnsname"
-        ;;
-      --launch)
-        launch=1
-        ;;
-      --rebuild)
-        rebuild=1
-        ;;
-      --)
-        shift
-        break;
-        ;;
-    esac
-    shift;
-  done
-}
+  init
 
-launchPod() {
-  [ $USER == "root" ] && exit 1
-
-  $rktCmd --name=$dnsname  --interactive --exec /bin/bash -- -c " \
-cd $containerDir; $containerDir/bin/rkt launch;\
-"
+  cp $0 /usr/bin/$podImage
 }
 
 downloadGiteaPkg() {
@@ -82,11 +42,6 @@ start() {
 
   sudo -u gitea GITEA_WORK_DIR=$GITEA_WORK_DIR/etc GITEA_CUSTOM=$GITEA_WORK_DIR/etc gitea
   popd
-}
-
-launch() {
-  build
-  start 
 }
 
 backup() {
@@ -130,70 +85,6 @@ startBackupTimer() {
   done
 }
 
-buildAciImage() {
-  [ $USER == "root" ] && exit 1
-
- 	_depCheck jq actool
-
-  local uuid=${1?"Require uuid"}
-  local acVersion=`date +%Y.%m.%d`
-  local tmpManifest=`mktemp`
-  local version=`date +%Y%m%d`
-  local created=`date -Is`
-  local outputAci=$podImage-$version.aci
-  echo Building Aci
-
-  echo ensuring stoppage 
-  sudo rkt stop $uuid || true
-  local state=`sudo rkt list | grep -i $uuid | awk '{print $4}'`
-  while [[ "$state" == "running" ]]; do 
-    sudo rkt stop $uuid || true
-    state=`sudo rkt list | grep -i 92b4bd88 | awk '{print $4}'`
-    sleep 1
-  done
-
-  #unmount !!! rootfs that aren't unmounted properly
-  sudo df -h | grep -i /$uuid | awk '{print $6}' | xargs sudo umount -l 2>&1 > /dev/null || true 
-
-  echo "Exporting $uuid to $outputAci"
-  sudo rkt export --overwrite $uuid $outputAci
-
-  echo "Updateing manifest"
-  actool cat-manifest $outputAci > $tmpManifest
-
-  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" $tmpManifest  | \
-  jq ".labels=([.labels[] | select (.name==\"version\") .value=\"$version\"])" | \
-  jq ".name = \"$podImage\"" | \
-  jq ".app.exec = [\"/usr/bin/$podImage\",\"start\"]" | \
-  jq ".acVersion = \"$acVersion\"" | \
-  sudo tee $tmpManifest.new
-  actool patch-manifest --replace --manifest=$tmpManifest.new $outputAci
-
-  sudo rm $tmpManifest $tmpManifest.new
-
-  echo "Removing old images"
-  sudo rkt image list | grep $podImage:$version | awk '{print $1}' | xargs -r sudo rkt image rm
-
-  sudo rkt fetch --insecure-options=all $outputAci
-}
-
-buildAci() { #--rebuild
-  [ $USER == "root" ] && exit 1
-
-  local tempFile=`mktemp`
-  rm $tempFile
-
-  name=`basename $tempFile | sed -r 's/tmp.//g'`
-  name=${name,,}
-
-  $rktCmd --name=$name  --interactive --exec /bin/bash -- -c " \
-cd $containerDir; bash -x $containerDir/bin/rkt build"
-
-  local uuid=`sudo rkt list | grep $name | awk '{print $1}'`
-  
-  buildAciImage $uuid
-}
-
 restore() {
   local backupFile="$1"
   local backupFolder=`mktemp -d`
@@ -213,134 +104,6 @@ restore() {
   wait
 
   rm -rf $backupFolder
-}
-
-build() {
-  #install pkgs
-  pacman -Syu --noconfirm --needed wget iproute git sudo openssh unzip awk
-
-  downloadGiteaPkg
-
-  groupadd gitea || true
-  useradd -m gitea -g gitea || true
-
-  echo "127.0.0.1 localhost" | tee -a /etc/hosts
-
-  init
-
-  cp $0 /usr/bin/$podImage
-}
-
-install() {
-  # make the rkt container start on boot
-  # should also check that the volume mounts are correct
-
-  local workDir="$1"
-
-  [ -z $workDir ] && (echo "No work directory found"; exit 1)
-
-  workDir=`pwd`/$workDir
-
-  if [ ! -d $workDir ]; then
-    echo "Directory not found $workDir"
-    return
-  fi
-
- 	_depCheck rkt
-
-  echo Installing $workDir
-
-  local rktCmd=`which rkt`
-
-  echo "[Unit]
-Description=$project
-
-[Service]
-ExecStart=
-ExecStart=$rktCmd run --insecure-options=all --interactive --volume project,kind=host,source=$workDir --mount volume=project,target=/var/lib/gitea $podImage --name=dns-giteadotlocal
-
-[Install]
-WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service > /dev/null
-
-  sudo systemctl enable $project.service
-  sudo systemctl restart $project.service
-}
-
-disableCacheCleanup() {
-  #important for not erasing the host pkg cache
-
-  if [ -e /etc/apt ]; then
-    rm -rf /etc/apt/apt.conf.d/*
-    echo 'Binary::apt::APT::Keep-Downloaded-Packages "1";' | tee /etc/apt/apt.conf.d/10apt-keep-downloads
-  fi
-
-  if [ -e /etc/pacman.conf ]; then
-    rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
-  fi
-}
-
-init() {
-  if hash git 2>/dev/null; then
-    if git rev-parse ; then
-      projectDir="`git rev-parse --show-toplevel`"
-      project="$(basename $projectDir)"
-      containerDir="/root/`basename $projectDir`"
-      projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
-      boxVolume="--volume gitea,kind=host,source=$projectDir/gitea --mount volume=gitea,target=/var/lib/gitea"
-      podImage="${project,,}-box"
-
-      volumes="$projectVolume $boxVolume"
-      if [ -e /etc/pacman.conf ]; then
-        local cacheDir=`_getVal CacheDir /etc/pacman.conf /var/cache/pacman/pkg`
-        echo "Pacman cache: $cacheDir"
-        local cacheVolume="--volume pkg,kind=host,source=$cacheDir --mount volume=pkg,target=/var/cache/pacman/pkg"
-        volumes="$volumes $cacheVolume"
-      fi
-
-      if [ -e ~/.cache/yay ]; then
-        local cacheDir="/home/$USER/.cache/yay"
-        echo "yay cache: $cacheDir"
-        local cacheVolume="--volume yay,kind=host,source=$cacheDir --mount volume=yay,target=/home/yay/.cache/yay"
-        volumes="$volumes $cacheVolume"
-      fi
-
-      if [ -e /etc/apt/sources.list ]; then
-        local cacheDir="/var/cache/apt/archives"
-        echo "Apt cache: $cacheDir"
-        local aptVolume="--volume apt,kind=host,source=$cacheDir --mount volume=apt,target=/var/cache/apt/archives"
-        volumes="$volumes $aptVolume"
-      fi
-
-      rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --insecure-options=all --dns=host $volumes run $baseImage"
-      podRktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --insecure-options=all --dns=host $volumes run $podImage"
-    fi
-  fi
-}
-
-main() {
-  disableCacheCleanup
-
-  init
-
-  if [ $# -eq 0 ]; then
-    echo $rktCmd
-    $rktCmd --interactive 
-    return
-  fi
-
-  parseArgs $@
-
-  if [ ! -z $launch ]; then
-    launchPod
-    return
-  fi
-
-  if [ ! -z $rebuild ]; then
-    buildAci
-    return
-  fi
-
-  $1 ${@:2}
 }
 
 main $@
