@@ -1,0 +1,321 @@
+#!/bin/bash
+
+set -e
+
+PATH=$PATH:/bin/:/usr/local/sbin/:/usr/sbin/:/sbin/
+
+declare -A volumeMap
+
+getVolumes() {
+  local volumes=""
+  for key in "${!volumeMap[@]}"; do 
+    local volumeName=`echo $key | sed -r 's#/##g'`
+    volumeName=${volumeName,,}
+    local tempVolume="--volume $volumeName,kind=host,source=$key --mount volume=$volumeName,target=${volumeMap[$key]}"
+    volumes="$volumes $tempVolume"
+  done
+  echo $volumes
+}
+
+
+_depCheck() {
+  for tool in $@; do
+    type ${tool}>/dev/null 2>&1 || { echo >&2 "I require ${tool} but it's not installed.  Aborting."; exit 1; }
+  done
+}
+
+_getVal() {
+  local key="$1"
+  local file="$2"
+  local val="`egrep \"^$key\" $file | sed -r 's/.*=\ *//g'`"
+
+  if [ "$val" == "" ]; then
+    echo $3
+  else
+    echo "$val"
+  fi
+}
+
+parseArgs() {
+  ARGS=$(getopt -l "pod,dnsname:,launch,rebuild" -- -- "$@")
+  if [ $? -ne 0 ]; then
+    echo "Bad arg"
+    exit 1
+  fi
+
+  eval set -- "$ARGS";
+
+  while true; do
+    case "$1" in
+      --dnsname)
+        shift
+        dnsname="dns-$1"
+        echo "DNSing to $dnsname"
+        ;;
+      --launch)
+        launch=1
+        ;;
+      --rebuild)
+        rebuild=1
+        ;;
+      --pod)
+        launch="1"
+        pod="1"
+        ;;
+      --)
+        shift
+        break;
+        ;;
+    esac
+    shift;
+  done
+}
+
+
+init() {
+  pwd
+  if hash git 2>/dev/null; then
+    if git rev-parse ; then
+      projectDir="`git rev-parse --show-toplevel`"
+      project="$(basename $projectDir)"
+      containerDir="/root/`basename $projectDir`"
+      projectVolume="--volume project,kind=host,source=$projectDir --mount volume=project,target=$containerDir"
+      podImage="${project,,}-box"
+      volumes="`getVolumes`"
+
+      volumes="$volumes $projectVolume"
+      if [ -e /etc/pacman.conf ]; then
+        local cacheDir=`_getVal CacheDir /etc/pacman.conf /var/cache/pacman/pkg`
+        echo "Pacman cache: $cacheDir"
+        local cacheVolume="--volume pkg,kind=host,source=$cacheDir --mount volume=pkg,target=/var/cache/pacman/pkg"
+        volumes="$volumes $cacheVolume"
+      fi
+
+      if [ -e ~/.cache/yay ]; then
+        local cacheDir="/home/$USER/.cache/yay"
+        echo "yay cache: $cacheDir"
+        local cacheVolume="--volume yay,kind=host,source=$cacheDir --mount volume=yay,target=/home/yay/.cache/yay"
+        volumes="$volumes $cacheVolume"
+      fi
+
+      if [ -e /etc/apt/sources.list ]; then
+        local cacheDir="/var/cache/apt/archives"
+        echo "Apt cache: $cacheDir"
+        local aptVolume="--volume apt,kind=host,source=$cacheDir --mount volume=apt,target=/var/cache/apt/archives"
+        volumes="$volumes $aptVolume"
+      fi
+
+      rktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --insecure-options=all --dns=host $volumes run $baseImage"
+      podRktCmd="sudo UNIFIED_CGROUP_HIERARCHY=no rkt --insecure-options=all --dns=host $volumes run $podImage"
+
+      echo projectDir: $projectDir
+      echo project: $project
+      echo containerDir: $containerDir
+      echo podImage: $podImage
+    fi
+  fi
+}
+
+disableCacheCleanup() {
+  #important for not erasing the host pkg cache
+
+  if [ -e /etc/apt ]; then
+    rm -rf /etc/apt/apt.conf.d/*
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "1";' | tee /etc/apt/apt.conf.d/10apt-keep-downloads
+  fi
+
+  if [ -e /etc/pacman.conf ]; then
+    rm -rf /usr/share/libalpm/hooks/package-cleanup.hook
+  fi
+}
+
+buildAciImage() {
+  [ $USER == "root" ] && exit 1
+
+  _depCheck jq actool
+
+  local buildDir=$projectDir/build
+  mkdir -p $buildDir
+
+  local uuid=${1?"Require uuid"}
+  local acVersion=`date +%Y.%m.%d`
+  local tmpManifest=`mktemp`
+  local version=`date +%Y%m%d`
+  local created=`date -Is`
+  local outputAci=$buildDir/$podImage-$version.aci
+  echo Building Aci
+
+  echo ensuring stoppage 
+  sudo rkt stop $uuid || true
+  local state=`sudo rkt list | grep -i $uuid | awk '{print $4}'`
+  while [[ "$state" == "running" ]]; do 
+    sudo rkt stop $uuid || true
+    state=`sudo rkt list | grep -i 92b4bd88 | awk '{print $4}'`
+    sleep 1
+  done
+
+  #unmount !!! rootfs that aren't unmounted properly
+  sudo df -h | grep -i /$uuid | awk '{print $6}' | xargs sudo umount -l 2>&1 > /dev/null || true 
+
+  echo "Exporting $uuid to $outputAci"
+  sudo rkt export --overwrite $uuid $outputAci
+
+  echo "Updating Manifest"
+  actool cat-manifest $outputAci > $tmpManifest
+
+  jq ".annotations=([.annotations[] | select (.name == \"created\") .value=\"$created\"])" $tmpManifest  | \
+  jq ".labels=([.labels[] | select (.name==\"version\") .value=\"$version\"])" | \
+  jq ".name = \"$podImage\"" | \
+  jq ".app.exec = [\"/usr/bin/$podImage\",\"start\"]" | \
+  jq ".acVersion = \"$acVersion\"" | \
+  sudo tee $tmpManifest.new
+  actool patch-manifest --replace --manifest=$tmpManifest.new $outputAci
+
+  sudo rm $tmpManifest $tmpManifest.new
+
+  echo "Removing old images"
+  sudo rkt image list | grep $podImage:$version | awk '{print $1}' | xargs -r sudo rkt image rm
+
+  echo Priming image store
+  sudo rkt fetch --insecure-options=all $outputAci
+}
+
+buildAci() { #--rebuild
+  [ $USER == "root" ] && exit 1
+
+  local tempFile=`mktemp`
+  rm $tempFile
+
+  name=`basename $tempFile | sed -r 's/tmp.//g'`
+  name=${name,,}
+
+  $rktCmd --name=$name  --interactive --exec /bin/bash -- -c " \
+cd $containerDir; bash -x $containerDir/bin/rkt build"
+
+  local uuid=`sudo rkt list | grep $name | awk '{print $1}'`
+  
+  buildAciImage $uuid
+}
+
+launchPod() {
+  [ $USER == "root" ] && exit 1
+
+  $rktCmd --name=$dnsname  --interactive --exec /bin/bash -- -c " \
+cd $containerDir; $containerDir/bin/rkt launch;\
+"
+}
+
+launch() {
+  build
+  start 
+}
+
+install() {
+  # make the rkt container start on boot
+  # should also check that the volume mounts are correct
+
+  init
+
+   _depCheck rkt
+
+  local volumes=""
+  for param in "$@"; do
+    echo $param
+    IFS=',' read -ra ADDR <<< "$param"
+    local key="${ADDR[0]}"
+    local value="${ADDR[1]}"
+    [ ! -e $key ] && (echo "No work directory found: $key"; exit 1)
+
+    echo "Mounting $key to $value"
+    local volumeName=`echo $key | sed -r 's#/##g'`
+    volumeName=${volumeName,,}
+
+    local tempVolume="--volume $volumeName,kind=host,source=$key --mount volume=$volumeName,target=$value"
+    local volumes="$volumes $tempVolume"
+  done
+
+  local rktCmd=`which rkt`
+
+  echo "[Unit]
+Description=$project
+
+[Service]
+ExecStart=
+ExecStart=$rktCmd run --dns=host --insecure-options=all --interactive $volumes $podImage --name=dns-${project}dotlocal
+
+[Install]
+WantedBy=multi-user.target" | sudo tee /etc/systemd/system/$project.service
+
+  sudo systemctl daemon-reload
+  sudo systemctl restart $project.service
+}
+
+DevOpsSetup() {
+  mkdir /root/.config/
+  pushd /root/.config/
+  rm -rf DevOps
+  git clone "https://github.com/neotericpiguy/DevOps"
+  cd DevOps
+  ./setup 
+  popd
+}
+
+yaySetup() {
+  if useradd -m yay; then
+    echo Adding /etc/sudoers entry
+    echo "yay ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+    echo -en "yay\nyay" | passwd yay
+    echo "MAKEFLAGS=\"-j\`nproc\`\"" >> /etc/makepkg.conf
+    echo "set -o vi" >> /root/.bashrc
+
+    mkdir -p /home/yay/src
+    chown -R yay /home/yay/src
+
+    yaySetup 
+    pushd /home/yay/src
+
+    chown -R yay /home/yay
+
+    rm -rf yay
+    sudo -u yay git clone "https://aur.archlinux.org/yay"
+    cd yay 
+    sudo -u yay makepkg -sif --noconfirm
+
+    popd
+  fi
+}
+
+main() {
+  disableCacheCleanup
+
+  volumes=`getVolumes`
+
+  init
+
+  if [ $# -eq 0 ]; then
+    echo $rktCmd
+    $rktCmd --interactive 
+    return
+  fi
+
+  parseArgs $@
+
+  if [ ! -z $rebuild ] && [ ! -z $pod ]; then
+    buildAci
+    return 
+  fi
+
+  if  [ ! -z $pod ]; then
+    $podRktCmd --interactive --exec /bin/bash
+    return 
+  fi
+
+  if [ ! -z $launch ]; then
+    launchPod
+    return
+  fi
+
+
+  $1 ${@:2}
+}
+
