@@ -18,10 +18,6 @@ build() {
   useradd -m gitea -g gitea || true
 
   echo "127.0.0.1 localhost" | tee -a /etc/hosts
-
-  init
-
-  cp $0 /usr/bin/$podImage
 }
 
 downloadGiteaPkg() {

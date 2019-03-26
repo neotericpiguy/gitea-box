@@ -17,7 +17,6 @@ getVolumes() {
   echo $volumes
 }
 
-
 _depCheck() {
   for tool in $@; do
     type ${tool}>/dev/null 2>&1 || { echo >&2 "I require ${tool} but it's not installed.  Aborting."; exit 1; }
@@ -190,7 +189,10 @@ buildAci() { #--rebuild
   name=${name,,}
 
   $rktCmd --name=$name  --interactive --exec /bin/bash -- -c " \
-cd $containerDir; bash -x $containerDir/bin/rkt build"
+    cd $containerDir; bash -x $containerDir/bin/rkt build; \
+    cp $containerDir/bin/rkt /usr/bin/$podImage; \
+    cp -r $containerDir/bin/* /bin/; 
+  "
 
   local uuid=`sudo rkt list | grep $name | awk '{print $1}'`
   
